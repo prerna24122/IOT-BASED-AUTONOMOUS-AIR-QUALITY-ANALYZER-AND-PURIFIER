@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""
+Unified Air Quality Monitoring Robot with Automatic Purification
+- Robot patrols when AQI ≤ 100 (good air)
+- Robot stops and fan activates when AQI > 100 (poor air)
+- All sensor readings compensated for temperature and humidity
+"""
+
+import time
+import board
+import busio
+import adafruit_ads1x15.ads1115 as ADS
+from adafruit_ads1x15.analog_in import AnalogIn
+import adafruit_dht
+import RPi.GPIO as GPIO
+from datetime import datetime
+import math
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+# ============ PIN CONFIGURATION ============
+
+# Environmental Sensors
+DHT_PIN = 4
+PM25_LED_PIN = 17
+RELAY_FAN_PIN = 22
+
+# Ultrasonic Sensors
+ULTRASONIC_FRONT_TRIG = 23
+ULTRASONIC_FRONT_ECHO = 24
+ULTRASONIC_SIDE_TRIG = 25
+ULTRASONIC_SIDE_ECHO = 8
+
+# IR Sensors
+IR_LEFT_PIN = 7
+IR_RIGHT_PIN = 12
+
+# L298N Motor Driver
+MOTOR_LEFT_EN = 13
+MOTOR_LEFT_IN1 = 19
+MOTOR_LEFT_IN2 = 26
+MOTOR_RIGHT_EN = 18
+MOTOR_RIGHT_IN1 = 20
+MOTOR_RIGHT_IN2 = 21
+
+# ============ GPIO SETUP ============
+
+# Environmental sensors
+GPIO.setup(PM25_LED_PIN, GPIO.OUT)
+GPIO.setup(RELAY_FAN_PIN, GPIO.OUT)
+GPIO.output(RELAY_FAN_PIN, GPIO.HIGH)  # Fan OFF initially
+
+# Ultrasonic sensors
+GPIO.setup(ULTRASONIC_FRONT_TRIG, GPIO.OUT)
+GPIO.setup(ULTRASONIC_FRONT_ECHO, GPIO.IN)
+GPIO.setup(ULTRASONIC_SIDE_TRIG, GPIO.OUT)
+GPIO.setup(ULTRASONIC_SIDE_ECHO, GPIO.IN)
+
+# IR sensors
+GPIO.setup(IR_LEFT_PIN, GPIO.IN)
+GPIO.setup(IR_RIGHT_PIN, GPIO.IN)
+
+# Motor driver
+GPIO.setup(MOTOR_LEFT_EN, GPIO.OUT)
+GPIO.setup(MOTOR_LEFT_IN1, GPIO.OUT)
+GPIO.setup(MOTOR_LEFT_IN2, GPIO.OUT)
+GPIO.setup(MOTOR_RIGHT_EN, GPIO.OUT)
+GPIO.setup(MOTOR_RIGHT_IN1, GPIO.OUT)
+GPIO.setup(MOTOR_RIGHT_IN2, GPIO.OUT)
+
+# PWM for motor speed control
+pwm_left = GPIO.PWM(MOTOR_LEFT_EN, 1000)
+pwm_right = GPIO.PWM(MOTOR_RIGHT_EN, 1000)
+pwm_left.start(0)
+pwm_right.start(0)
+
+# ============ I2C AND SENSOR SETUP ============
+
+i2c = busio.I2C(board.SCL, board.SDA)
+ads = ADS.ADS1115(i2c)
+
+mq7_channel = AnalogIn(ads, 0)
+mq135_channel = AnalogIn(ads, 1)
+pm25_channel = AnalogIn(ads, 2)
+
+dht_sensor = adafruit_dht.DHT22(DHT_PIN, use_pulseio=False)
+
+# ============ CONFIGURATION PARAMETERS ============
+
+# AQI threshold for actions
+AQI_THRESHOLD = 100  # Fan ON and Robot STOPS when AQI > 100
+
+# Navigation parameters
+OBSTACLE_DISTANCE = 20  # cm
+SIDE_DISTANCE = 15      # cm
+MOTOR_SPEED = 70        # 0-100 percentage
+
+# Sensor baseline values (calibrate these in clean air)
+BASELINE = {
+    'mq7_clean': 0.4,    # Voltage at clean air for MQ-7
+    'mq135_clean': 0.3,  # Voltage at clean air for MQ-135
+}
+
+# ============ SENSOR READING FUNCTIONS ============
+
+def read_dht22():
+    """Read temperature and humidity from DHT22"""
+    try:
+        temperature = dht_sensor.temperature
+        humidity = dht_sensor.humidity
+        return temperature, humidity
+    except:
+        return None, None
+
+def read_mq7():
+    """Read MQ-7 CO sensor voltage"""
+    try:
+        return mq7_channel.voltage
+    except:
+        return None
+
+def read_mq135():
+    """Read MQ-135 air quality sensor voltage"""
+    try:
+        return mq135_channel.voltage
+    except:
+        return None
+
+def read_pm25():
+    """Read PM2.5 dust sensor"""
+    try:
+        GPIO.output(PM25_LED_PIN, GPIO.LOW)
+        time.sleep(0.00028)
+        voltage = pm25_channel.voltage
+        GPIO.output(PM25_LED_PIN, GPIO.HIGH)
+        time.sleep(0.00004)
+        
+        if voltage > 0.6:
+            dust_density = (voltage - 0.6) * 300
+        else:
+            dust_density = 0
+        return voltage, dust_density
+    except:
+        return None, None
+
+# ============ TEMPERATURE/HUMIDITY COMPENSATION ============
+
+def compensate_sensor_reading(raw_value, temp, humidity):
+    """
+    Compensate gas sensor readings for temperature and humidity effects
+    Reference conditions: 20°C, 65% RH
+    """
+    if temp is None or humidity is None or raw_value is None:
+        return raw_value
+    
+    # Reference conditions
+    ref_temp = 20
+    ref_humidity = 65
+    
+    # Temperature compensation (gas sensors show higher response at higher temps)
+    # 1% change per degree Celsius
+    temp_factor = 1.0 + ((temp - ref_temp) * 0.01)
+    
+    # Humidity compensation (moisture interferes with gas detection)
+    # 0.3% change per %RH
+    humidity_factor = 1.0 + ((humidity - ref_humidity) * 0.003)
+    
+    # Apply compensation to get true reading
+    compensated = raw_value / (temp_factor * humidity_factor)
+    
+    return compensated
+
+# ============ AQI CALCULATION ============
+
+def calculate_aqi(mq7_voltage, mq135_voltage, pm25_density, temp, humidity):
+    """
+    Calculate combined AQI based on all pollutants with temp/humidity compensation
+    Returns the MAXIMUM (worst) AQI among all pollutants (EPA method)
+    """
+    if mq7_voltage is None and mq135_voltage is None and pm25_density is None:
+        return None, None, None, None
+    
+    # ===== CO SENSOR (MQ-7) PROCESSING =====
+    co_ppm = None
+    co_aqi = None
+    
+    if mq7_voltage is not None:
+        # Apply temperature and humidity compensation
+        co_compensated = compensate_sensor_reading(mq7_voltage, temp, humidity)
+        
+        # Calculate CO concentration in ppm
+        ratio = co_compensated / BASELINE['mq7_clean']
+        if ratio >= 1:
+            co_ppm = 10 ** ((math.log10(ratio) - 0.6) / 0.3)
+        else:
+            co_ppm = 0
+        
+        # Calculate CO AQI (EPA standards)
+        if co_ppm < 4.4:
+            co_aqi = (co_ppm / 4.4) * 50
+        elif co_ppm < 9.4:
+            co_aqi = 50 + ((co_ppm - 4.4) / 5.0) * 50
+        elif co_ppm < 12.4:
+            co_aqi = 100 + ((co_ppm - 9.4) / 3.0) * 50
+        elif co_ppm < 15.4:
+            co_aqi = 150 + ((co_ppm - 12.4) / 3.0) * 50
+        elif co_ppm < 30.4:
+            co_aqi = 200 + ((co_ppm - 15.4) / 15.0) * 100
+        else:
+            co_aqi = 300 + min((co_ppm - 30.4) / 20.0 * 200, 200)
+        co_aqi = round(co_aqi)
+    
+    # ===== VOC SENSOR (MQ-135) PROCESSING =====
+    voc_ratio = None
+    voc_aqi = None
+    
+    if mq135_voltage is not None:
+        # Apply temperature and humidity compensation
+        voc_compensated = compensate_sensor_reading(mq135_voltage, temp, humidity)
+        
+        # Calculate VOC ratio
+        voc_ratio = voc_compensated / BASELINE['mq135_clean']
+        
+        # Calculate VOC AQI (empirical mapping)
+        if voc_ratio < 1.2:
+            voc_aqi = (voc_ratio - 1.0) * 250
+        elif voc_ratio < 1.5:
+            voc_aqi = 50 + (voc_ratio - 1.2) * 166.7
+        elif voc_ratio < 2.0:
+            voc_aqi = 100 + (voc_ratio - 1.5) * 100
+        elif voc_ratio < 3.0:
+            voc_aqi = 150 + (voc_ratio - 2.0) * 50
+        elif voc_ratio < 5.0:
+            voc_aqi = 200 + (voc_ratio - 3.0) * 50
+        else:
+            voc_aqi = 300 + min((voc_ratio - 5.0) * 40, 200)
+        voc_aqi = round(voc_aqi)
+    
+    # ===== PM2.5 SENSOR PROCESSING =====
+    pm25_aqi = None
+    
+    if pm25_density is not None:
+        # PM2.5 is not significantly affected by temp/humidity in measurement
+        # Calculate PM2.5 AQI (EPA standards)
+        if pm25_density < 12.0:
+            pm25_aqi = (pm25_density / 12.0) * 50
+        elif pm25_density < 35.4:
+            pm25_aqi = 50 + ((pm25_density - 12.0) / 23.4) * 50
+        elif pm25_density < 55.4:
+            pm25_aqi = 100 + ((pm25_density - 35.4) / 20.0) * 50
+        elif pm25_density < 150.4:
+            pm25_aqi = 150 + ((pm25_density - 55.4) / 95.0) * 50
+        elif pm25_density < 250.4:
+            pm25_aqi = 200 + ((pm25_density - 150.4) / 100.0) * 100
+        else:
+            pm25_aqi = 300 + min((pm25_density - 250.4) / 250.0 * 200, 200)
+        pm25_aqi = round(pm25_aqi)
+    
+    # ===== COMBINED AQI (EPA METHOD) =====
+    # Take the MAXIMUM (worst) pollutant AQI
+    aqi_values = []
+    if co_aqi is not None:
+        aqi_values.append(co_aqi)
+    if voc_aqi is not None:
+        aqi_values.append(voc_aqi)
+    if pm25_aqi is not None:
+        aqi_values.append(pm25_aqi)
+    
+    if not aqi_values:
+        return None, None, None, None
+    
+    combined_aqi = max(aqi_values)
+    
+    # Cap at 500
+    if combined_aqi > 500:
+        combined_aqi = 500
+    
+    return combined_aqi, co_ppm, voc_ratio, pm25_density
+
+def get_aqi_category(aqi):
+    """Get AQI category and color"""
+    if aqi is None:
+        return "UNKNOWN", "N/A"
+    
+    if aqi <= 50:
+        return "GOOD", "Green"
+    elif aqi <= 100:
+        return "MODERATE", "Yellow"
+    elif aqi <= 150:
+        return "UNHEALTHY FOR SENSITIVE", "Orange"
+    elif aqi <= 200:
+        return "UNHEALTHY", "Red"
+    elif aqi <= 300:
+        return "VERY UNHEALTHY", "Purple"
+    else:
+        return "HAZARDOUS", "Maroon"
+
+def get_health_message(aqi):
+    """Get health advisory based on AQI"""
+    if aqi is None:
+        return "Unable to determine air quality"
+    
+    if aqi <= 50:
+        return "Air quality is satisfactory"
+    elif aqi <= 100:
+        return "Air quality is acceptable"
+    elif aqi <= 150:
+        return "Sensitive groups should reduce exposure"
+    elif aqi <= 200:
+        return "Everyone should reduce prolonged exertion"
+    elif aqi <= 300:
+        return "Health alert: Everyone may experience effects"
+    else:
+        return "Health warning: Avoid outdoor exposure"
+
+# ============ FAN CONTROL ============
+
+def control_fan(aqi):
+    """
+    Control purification fan based on AQI only
+    Fan ON when AQI > 100
+    Fan OFF when AQI ≤ 100
+    """
+    if aqi is None:
+        GPIO.output(RELAY_FAN_PIN, GPIO.HIGH)  # Fan OFF if no reading
+        return "OFF (No AQI)"
+    
+    if aqi > AQI_THRESHOLD:
+        GPIO.output(RELAY_FAN_PIN, GPIO.LOW)  # Fan ON
+        return f"ON (AQI: {aqi})"
+    else:
+        GPIO.output(RELAY_FAN_PIN, GPIO.HIGH)  # Fan OFF
+        return f"OFF (AQI: {aqi})"
+
+# ============ NAVIGATION FUNCTIONS ============
+
+def read_ultrasonic(trig_pin, echo_pin):
+    """Read distance from ultrasonic sensor"""
+    try:
+        GPIO.output(trig_pin, False)
+        time.sleep(0.00001)
+        
+        GPIO.output(trig_pin, True)
+        time.sleep(0.00001)
+        GPIO.output(trig_pin, False)
+        
+        timeout = time.time() + 0.1
+        while GPIO.input(echo_pin) == 0:
+            pulse_start = time.time()
+            if time.time() > timeout:
+                return None
+        
+        timeout = time.time() + 0.1
+        while GPIO.input(echo_pin) == 1:
+            pulse_end = time.time()
+            if time.time() > timeout:
+                return None
+        
+        pulse_duration = pulse_end - pulse_start
+        distance = pulse_duration * 17150
+        distance = round(distance, 2)
+        
+        if distance < 400:
+            return distance
+        else:
+            return None
+    except:
+        return None
+
+def read_ir_sensors():
+    """Read IR sensors - returns True if obstacle detected"""
+    left_obstacle = GPIO.input(IR_LEFT_PIN) == GPIO.LOW
+    right_obstacle = GPIO.input(IR_RIGHT_PIN) == GPIO.LOW
+    return left_obstacle, right_obstacle
+
+def stop_motors():
+    """Stop both motors"""
+    pwm_left.ChangeDutyCycle(0)
+    pwm_right.ChangeDutyCycle(0)
+    GPIO.output(MOTOR_LEFT_IN1, GPIO.LOW)
+    GPIO.output(MOTOR_LEFT_IN2, GPIO.LOW)
+    GPIO.output(MOTOR_RIGHT_IN1, GPIO.LOW)
+    GPIO.output(MOTOR_RIGHT_IN2, GPIO.LOW)
+
+def move_forward(speed=MOTOR_SPEED):
+    """Move both motors forward"""
+    GPIO.output(MOTOR_LEFT_IN1, GPIO.HIGH)
+    GPIO.output(MOTOR_LEFT_IN2, GPIO.LOW)
+    GPIO.output(MOTOR_RIGHT_IN1, GPIO.HIGH)
+    GPIO.output(MOTOR_RIGHT_IN2, GPIO.LOW)
+    pwm_left.ChangeDutyCycle(speed)
+    pwm_right.ChangeDutyCycle(speed)
+
+def move_backward(speed=MOTOR_SPEED):
+    """Move both motors backward"""
+    GPIO.output(MOTOR_LEFT_IN1, GPIO.LOW)
+    GPIO.output(MOTOR_LEFT_IN2, GPIO.HIGH)
+    GPIO.output(MOTOR_RIGHT_IN1, GPIO.LOW)
+    GPIO.output(MOTOR_RIGHT_IN2, GPIO.HIGH)
+    pwm_left.ChangeDutyCycle(speed)
+    pwm_right.ChangeDutyCycle(speed)
+
+def turn_left(speed=MOTOR_SPEED):
+    """Turn left"""
+    GPIO.output(MOTOR_LEFT_IN1, GPIO.LOW)
+    GPIO.output(MOTOR_LEFT_IN2, GPIO.HIGH)
+    GPIO.output(MOTOR_RIGHT_IN1, GPIO.HIGH)
+    GPIO.output(MOTOR_RIGHT_IN2, GPIO.LOW)
+    pwm_left.ChangeDutyCycle(speed)
+    pwm_right.ChangeDutyCycle(speed)
+
+def turn_right(speed=MOTOR_SPEED):
+    """Turn right"""
+    GPIO.output(MOTOR_LEFT_IN1, GPIO.HIGH)
+    GPIO.output(MOTOR_LEFT_IN2, GPIO.LOW)
+    GPIO.output(MOTOR_RIGHT_IN1, GPIO.LOW)
+    GPIO.output(MOTOR_RIGHT_IN2, GPIO.HIGH)
+    pwm_left.ChangeDutyCycle(speed)
+    pwm_right.ChangeDutyCycle(speed)
+
+def navigate(aqi):
+    """
+    Navigation logic based on AQI
+    Robot MOVES when AQI ≤ 100 (good air)
+    Robot STOPS when AQI > 100 (poor air, fan purifying)
+    """
+    front_distance = read_ultrasonic(ULTRASONIC_FRONT_TRIG, ULTRASONIC_FRONT_ECHO)
+    side_distance = read_ultrasonic(ULTRASONIC_SIDE_TRIG, ULTRASONIC_SIDE_ECHO)
+    ir_left, ir_right = read_ir_sensors()
+    
+    # Check if robot should move based on AQI
+    if aqi is None:
+        stop_motors()
+        return "STOPPED - No AQI Data", front_distance, side_distance, ir_left, ir_right
+    
+    if aqi > AQI_THRESHOLD:
+        stop_motors()
+        return f"STOPPED - Air Quality Poor (AQI: {aqi})", front_distance, side_distance, ir_left, ir_right
+    
+    # AQI is acceptable, robot can patrol
+    action = "PATROLLING"
+    
+    # Obstacle avoidance logic
+    if front_distance is not None and front_distance < OBSTACLE_DISTANCE:
+        stop_motors()
+        time.sleep(0.2)
+        move_backward(MOTOR_SPEED)
+        time.sleep(0.5)
+        stop_motors()
+        time.sleep(0.2)
+        turn_right(MOTOR_SPEED)
+        time.sleep(0.8)
+        stop_motors()
+        action = "AVOIDING - Front Obstacle"
+    
+    elif side_distance is not None and side_distance < SIDE_DISTANCE:
+        turn_left(MOTOR_SPEED)
+        time.sleep(0.3)
+        stop_motors()
+        action = "AVOIDING - Side Obstacle"
+    
+    elif ir_left and ir_right:
+        stop_motors()
+        move_backward(MOTOR_SPEED)
+        time.sleep(0.5)
+        stop_motors()
+        action = "AVOIDING - Edge Detected"
+    
+    elif ir_left:
+        turn_right(MOTOR_SPEED)
+        time.sleep(0.3)
+        stop_motors()
+        action = "AVOIDING - Left Edge"
+    
+    elif ir_right:
+        turn_left(MOTOR_SPEED)
+        time.sleep(0.3)
+        stop_motors()
+        action = "AVOIDING - Right Edge"
+    
+    else:
+        move_forward(MOTOR_SPEED)
+        action = f"PATROLLING - Air Good (AQI: {aqi})"
+    
+    return action, front_distance, side_distance, ir_left, ir_right
+
+# ============ MAIN FUNCTION ============
+
+def main():
+    print("="*70)
+    print("UNIFIED AIR QUALITY ROBOT SYSTEM")
+    print("="*70)
+    print("Features:")
+    print("  - Continuous air quality monitoring with AQI calculation")
+    print("  - Temperature/Humidity compensation for accurate readings")
+    print("  - Automatic fan activation when AQI > 100")
+    print("  - Robot patrol when AQI ≤ 100")
+    print("  - Robot stops when AQI > 100 for safety")
+    print("="*70)
+    print("\nWarming up sensors (30 seconds)...")
+    time.sleep(30)
+    print("System ready!\n")
+    
+    try:
+        while True:
+            # Read environmental conditions
+            temp, humidity = read_dht22()
+            
+            # Read air quality sensors
+            mq7_voltage = read_mq7()
+            mq135_voltage = read_mq135()
+            pm25_voltage, pm25_density = read_pm25()
+            
+            # Calculate AQI with temperature/humidity compensation
+            aqi, co_ppm, voc_ratio, pm25_ug = calculate_aqi(
+                mq7_voltage, mq135_voltage, pm25_density, temp, humidity
+            )
+            
+            # Get AQI information
+            category, color = get_aqi_category(aqi)
+            health_msg = get_health_message(aqi)
+            
+            # Control fan based on AQI only
+            fan_status = control_fan(aqi)
+            
+            # Navigate based on AQI
+            nav_action, front_dist, side_dist, ir_left, ir_right = navigate(aqi)
+            
+            # Display system status
+            print("\n" + "="*70)
+            print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print("="*70)
+            
+            print("\nENVIRONMENTAL CONDITIONS:")
+            if temp is not None and humidity is not None:
+                print(f"  Temperature: {temp:.1f}°C (Compensating sensors)")
+                print(f"  Humidity: {humidity:.1f}% (Compensating sensors)")
+            else:
+                print("  Temperature/Humidity: Reading failed")
+            
+            print("\nCOMPENSATED SENSOR READINGS:")
+            if mq7_voltage is not None:
+                comp_mq7 = compensate_sensor_reading(mq7_voltage, temp, humidity)
+                print(f"  MQ-7 (CO): {mq7_voltage:.3f}V → {comp_mq7:.3f}V (compensated)", end="")
+                if co_ppm is not None:
+                    print(f" → ~{co_ppm:.1f} ppm CO")
+                else:
+                    print()
+            else:
+                print("  MQ-7 (CO): Reading failed")
+            
+            if mq135_voltage is not None:
+                comp_mq135 = compensate_sensor_reading(mq135_voltage, temp, humidity)
+                print(f"  MQ-135 (VOC): {mq135_voltage:.3f}V → {comp_mq135:.3f}V (compensated)", end="")
+                if voc_ratio is not None:
+                    print(f" → Ratio: {voc_ratio:.2f}")
+                else:
+                    print()
+            else:
+                print("  MQ-135 (VOC): Reading failed")
+            
+            if pm25_voltage is not None and pm25_density is not None:
+                print(f"  PM2.5 (Dust): {pm25_voltage:.3f}V → {pm25_density:.1f} μg/m³")
+            else:
+                print("  PM2.5 (Dust): Reading failed")
+            
+            print("\n" + "="*70)
+            print("AIR QUALITY INDEX (AQI):")
+            print("="*70)
+            if aqi is not None:
+                print(f"  AQI: {aqi} - {category} ({color})")
+                print(f"  Health: {health_msg}")
+                print(f"  Threshold: {AQI_THRESHOLD} (Fan/Robot trigger)")
+            else:
+                print("  AQI: Unable to calculate")
+            print("="*70)
+            
+            print(f"\nPURIFICATION FAN: {fan_status}")
+            if aqi is not None:
+                if aqi > AQI_THRESHOLD:
+                    print("  → Actively purifying air")
+                else:
+                    print("  → Air quality acceptable")
+            
+            print(f"\nROBOT STATUS: {nav_action}")
+            print(f"  Front: {front_dist if front_dist else 'N/A'} cm")
+            print(f"  Side: {side_dist if side_dist else 'N/A'} cm")
+            print(f"  IR Left: {'OBSTACLE' if ir_left else 'CLEAR'}")
+            print(f"  IR Right: {'OBSTACLE' if ir_right else 'CLEAR'}")
+            
+            if aqi is not None:
+                if aqi <= AQI_THRESHOLD:
+                    print(f"  → Mode: PATROL (AQI ≤ {AQI_THRESHOLD})")
+                else:
+                    print(f"  → Mode: STATIONARY PURIFICATION (AQI > {AQI_THRESHOLD})")
+            
+            print("="*70)
+            time.sleep(5)
+            
+    except KeyboardInterrupt:
+        print("\n\nSystem stopped by user")
+    except Exception as e:
+        print(f"\n\nError: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        stop_motors()
+        pwm_left.stop()
+        pwm_right.stop()
+        GPIO.output(RELAY_FAN_PIN, GPIO.HIGH)
+        GPIO.cleanup()
+        print("\nGPIO cleaned up. System shutdown complete.")
+
+if _name_ == "_main_":
+    main()
